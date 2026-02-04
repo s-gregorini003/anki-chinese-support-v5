@@ -43,6 +43,7 @@ SPEECH_ENGINES = {
     'Google Mandarin (PRC)': 'google|zh-CN',
     'Google Mandarin (Taiwan)': 'google|zh-TW',
     'Amazon Polly': 'aws|Zhiyu',
+    'Qwen3-TTS (Cloud, Voice Clone)': 'qwen|zhCN',
     'Disabled': None,
 }
 

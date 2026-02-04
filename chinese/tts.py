@@ -19,6 +19,8 @@ from gtts.tts import gTTSError
 
 from .aws import AWS4Signer
 
+from gradio_client import Client, handle_file
+
 requests.packages.urllib3.disable_warnings()
 
 
@@ -31,6 +33,7 @@ class AudioDownloader:
             'google': self.get_google,
             'baidu': self.get_baidu,
             'aws': self.get_aws,
+            'qwen': self.get_qwen_cloud,
         }.get(self.service)
 
     def get_path(self):
@@ -109,3 +112,47 @@ class AudioDownloader:
 
         with open(self.path, 'wb') as audio:
             audio.write(response.content)
+
+    def get_qwen_cloud(self):
+        # Read reference audio config that you'll configure via a UI (see below)
+        config = mw.addonManager.getConfig(__name__)
+        ref_audio_path = config.get("qwen_ref_audio_path")
+        ref_text       = config.get("qwen_ref_text", "")
+
+        if not ref_audio_path or not os.path.exists(ref_audio_path):
+            raise RuntimeError("Qwen3-TTS reference audio not configured or file missing.")
+
+        # 1. Construct client targeting the official Space
+        client = Client("Qwen/Qwen3-TTS")
+
+        # 2. Call the /generate_voice_clone API with user’s reference audio and text to speak
+        result = client.predict(
+            ref_audio=handle_file(ref_audio_path),
+            ref_text=ref_text,
+            target_text=self.text,
+            language="Auto",
+            use_xvector_only=False,
+            model_size="1.7B",
+            api_name="/generate_voice_clone",
+        )
+
+        # 3. Save returned audio to self.path. The exact type of `result` depends on the Space.
+        # The most common patterns:
+        if isinstance(result, str):
+            # Could be a local filepath or a URL
+            if os.path.exists(result):
+                shutil.copyfile(result, self.path)
+            else:
+                # treat it as a URL and download
+                import requests
+                r = requests.get(result, timeout=30)
+                r.raise_for_status()
+                with open(self.path, "wb") as f:
+                    f.write(r.content)
+
+        elif isinstance(result, dict) and "path" in result:
+            shutil.copyfile(result["path"], self.path)
+        else:
+            # For first run, log result to Anki console so you can inspect its structure
+            print("Unexpected Qwen3-TTS result:", repr(result))
+            raise RuntimeError("Unexpected result from Qwen3-TTS API.")
