@@ -1,4 +1,4 @@
-# Chinese Support 3
+# \[WIP- Do not download!\] Chinese Support 5 - Add Qwen3-TTS
 
 Chinese Support 3 is an Anki 23.10-compatible version of the [original](https://github.com/ttempe/chinese-support-addon) Chinese Support add-on and its [redux version](https://github.com/luoliyan/chinese-support-redux). I have tested it on 2.1.66 which seems to work, no testing has been done on earlier versions though. It offers a number of features that streamline the process of creating flashcards for learning Chinese. Some of the features had stopped working, and after taking my time to get these back going I thought that I might as well publish it for others to use.
 
