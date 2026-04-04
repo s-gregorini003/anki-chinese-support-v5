@@ -37,6 +37,8 @@ from .fill import (
 )
 from .main import config
 
+from .qwen_gui import QwenVoiceSetupDialog
+
 
 SPEECH_ENGINES = {
     'Baidu Translate': 'baidu|zh',
@@ -73,6 +75,8 @@ def load_menu():
             checkable=True,
             checked=bool(config['speech'] == v),
         )
+
+    add_menu_item('Chinese', ('Qwen3-TTS Voice Setup...'), open_qwen_voice_setup)
 
     add_menu('Chinese::Bulk Fill')
     add_menu_item('Chinese::Bulk Fill', ('Hanzi'), bulk_fill_hanzi)
@@ -152,3 +156,12 @@ def add_menu_item(path, text, func, keys=None, checkable=False, checked=False):
     else:
         add_menu(path)
         mw.custom_menus[path].addAction(action)
+
+def open_qwen_voice_setup():
+
+    dlg = QwenVoiceSetupDialog(mw)
+
+    dlg.exec()
+
+
+    

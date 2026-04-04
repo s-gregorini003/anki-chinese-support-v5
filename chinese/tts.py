@@ -6,11 +6,14 @@
 # Inspiration: Tymon Warecki
 # License: GNU AGPL, version 3 or later; http://www.gnu.org/copyleft/agpl.html
 
+import os
 import ssl
 from os.path import basename, exists, join
 from re import sub
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+import json
+import tempfile
 
 import requests
 from aqt import mw
@@ -19,26 +22,25 @@ from gtts.tts import gTTSError
 
 from .aws import AWS4Signer
 
-from gradio_client import Client, handle_file
-
 requests.packages.urllib3.disable_warnings()
 
 
 class AudioDownloader:
-    def __init__(self, text, source='google|zh-CN'):
+    def __init__(self, text, source='google|zhCN'):
         self.text = text
         self.service, self.lang = source.split('|')
-        self.path = self.get_path()
+        ext = 'wav' if self.service == 'qwen_cloud' else 'mp3'
+        self.path = self.get_path(ext=ext)
         self.func = {
-            'google': self.get_google,
-            'baidu': self.get_baidu,
-            'aws': self.get_aws,
-            'qwen': self.get_qwen_cloud,
+            'google':     self.get_google,
+            'baidu':      self.get_baidu,
+            'aws':        self.get_aws,
+            'qwen_cloud': self.get_qwen_cloud,
         }.get(self.service)
 
-    def get_path(self):
-        filename = '{}_{}_{}.mp3'.format(
-            self.sanitize(self.text), self.service, self.lang
+    def get_path(self, ext='mp3'):
+        filename = '{}_{}_{}.{}'.format(
+            self.sanitize(self.text), self.service, self.lang, ext
         )
         return join(mw.col.media.dir(), filename)
 
@@ -114,45 +116,140 @@ class AudioDownloader:
             audio.write(response.content)
 
     def get_qwen_cloud(self):
-        # Read reference audio config that you'll configure via a UI (see below)
-        config = mw.addonManager.getConfig(__name__)
-        ref_audio_path = config.get("qwen_ref_audio_path")
-        ref_text       = config.get("qwen_ref_text", "")
+        """
+        Generate speech via the Qwen3-TTS Hugging Face Space using voice cloning.
 
-        if not ref_audio_path or not os.path.exists(ref_audio_path):
-            raise RuntimeError("Qwen3-TTS reference audio not configured or file missing.")
+        Reads from Anki add-on config:
+            qwen_ref_audio  : absolute path to the local reference WAV file
+            qwen_ref_text   : transcript of the reference audio (Chinese)
+            qwen_language   : dropdown value, default "Auto"
+            qwen_use_xvector: bool, default True
+            qwen_model_size : "0.6B" or "3B", default "0.6B"
 
-        # 1. Construct client targeting the official Space
-        client = Client("Qwen/Qwen3-TTS")
+        Flow:
+            1. Upload ref audio to tmpfiles.org → get public URL
+            2. POST to /gradio_api/call/generate_voice_clone → get event_id
+            3. GET stream → parse SSE until event: complete
+            4. Download result audio → save to self.path
+        """
+        SPACE_URL = "https://qwen-qwen3-tts.hf.space"
 
-        # 2. Call the /generate_voice_clone API with user’s reference audio and text to speak
-        result = client.predict(
-            ref_audio=handle_file(ref_audio_path),
-            ref_text=ref_text,
-            target_text=self.text,
-            language="Auto",
-            use_xvector_only=False,
-            model_size="1.7B",
-            api_name="/generate_voice_clone",
+        # ── Read config ────────────────────────────────────────────────────────
+        cfg = mw.addonManager.getConfig(__name__) or {}
+        ref_audio_path = cfg.get('qwen_ref_audio', '')
+        ref_text       = cfg.get('qwen_ref_text', '')
+        language       = cfg.get('qwen_language', 'Auto')
+        use_xvector    = cfg.get('qwen_use_xvector', True)
+        model_size     = cfg.get('qwen_model_size', '0.6B')
+
+        if not ref_audio_path or not exists(ref_audio_path):
+            raise FileNotFoundError(
+                'Qwen TTS: reference audio not found. '
+                'Set "qwen_ref_audio" in the add-on config to an absolute path.'
+            )
+        if not ref_text:
+            raise ValueError(
+                'Qwen TTS: "qwen_ref_text" is empty. '
+                'Set it in the add-on config to the transcript of your reference audio.'
+            )
+
+        session = requests.Session()
+
+        # ── Step 1: Upload ref audio to tmpfiles.org ───────────────────────────
+        with open(ref_audio_path, 'rb') as f:
+            upload_resp = requests.post(
+                'https://tmpfiles.org/api/v1/upload',
+                files={'file': (basename(ref_audio_path), f, 'audio/wav')},
+                timeout=60,
+            )
+        upload_resp.raise_for_status()
+
+        viewer_url = upload_resp.json()['data']['url']
+        # Convert viewer URL → direct download URL
+        # https://tmpfiles.org/XXXX/file.wav → https://tmpfiles.org/dl/XXXX/file.wav
+        public_url = viewer_url.replace('tmpfiles.org/', 'tmpfiles.org/dl/')
+
+        ref_audio_obj = {
+            'path': public_url,
+            'meta': {'_type': 'gradio.FileData'},
+        }
+
+        # ── Step 2: Start voice clone job ─────────────────────────────────────
+        payload = {
+            'data': [
+                ref_audio_obj,
+                ref_text,
+                self.text,      # target text = the word/sentence Anki wants spoken
+                language,
+                use_xvector,
+                model_size,
+            ]
+        }
+
+        call_resp = session.post(
+            SPACE_URL + '/gradio_api/call/generate_voice_clone',
+            headers={'Content-Type': 'application/json'},
+            data=json.dumps(payload),
+            timeout=60,
+        )
+        call_resp.raise_for_status()
+
+        event_id = call_resp.json().get('event_id')
+        if not event_id:
+            raise RuntimeError(
+                f'Qwen TTS: no event_id in response: {call_resp.text[:200]}'
+            )
+
+        # ── Step 3: Stream SSE until event: complete ───────────────────────────
+        stream_url = SPACE_URL + f'/gradio_api/call/generate_voice_clone/{event_id}'
+        last_obj   = None
+        event_type = None
+
+        with session.get(stream_url, stream=True, timeout=300) as stream_resp:
+            stream_resp.raise_for_status()
+
+            for raw_line in stream_resp.iter_lines():
+                if not raw_line:
+                    continue
+
+                decoded = raw_line.decode('utf-8')
+
+                if decoded.startswith('event:'):
+                    event_type = decoded[len('event:'):].strip()
+                    continue
+
+                if decoded.startswith('data:'):
+                    data_str = decoded[len('data:'):].strip()
+                    if not data_str or data_str == 'null':
+                        continue
+
+                    try:
+                        obj = json.loads(data_str)
+                        last_obj = obj
+
+                        if event_type == 'complete':
+                            break
+                        if event_type == 'error':
+                            raise RuntimeError(f'Qwen TTS: Space returned error: {obj}')
+
+                    except json.JSONDecodeError:
+                        pass   # heartbeat or non-JSON line — ignore
+
+        if last_obj is None:
+            raise RuntimeError('Qwen TTS: stream ended with no audio data.')
+
+        # ── Step 4: Download and save audio ───────────────────────────────────
+        audio_data = last_obj[0]   # FileData dict
+        audio_url  = (
+            audio_data.get('url')
+            or SPACE_URL + '/gradio_api/file=' + audio_data['path']
         )
 
-        # 3. Save returned audio to self.path. The exact type of `result` depends on the Space.
-        # The most common patterns:
-        if isinstance(result, str):
-            # Could be a local filepath or a URL
-            if os.path.exists(result):
-                shutil.copyfile(result, self.path)
-            else:
-                # treat it as a URL and download
-                import requests
-                r = requests.get(result, timeout=30)
-                r.raise_for_status()
-                with open(self.path, "wb") as f:
-                    f.write(r.content)
+        audio_resp = session.get(audio_url, timeout=60)
+        audio_resp.raise_for_status()
 
-        elif isinstance(result, dict) and "path" in result:
-            shutil.copyfile(result["path"], self.path)
-        else:
-            # For first run, log result to Anki console so you can inspect its structure
-            print("Unexpected Qwen3-TTS result:", repr(result))
-            raise RuntimeError("Unexpected result from Qwen3-TTS API.")
+        with open(self.path, 'wb') as out:
+            out.write(audio_resp.content)
+            
+
+            
